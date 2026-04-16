@@ -1,0 +1,156 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  IMAGE_PREFIX: ${{ secrets.DOCKER_USERNAME }}/ai-tasks
+
+jobs:
+  # ========================
+  # Job 1: Lint
+  # ========================
+  lint:
+    name: Lint & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Lint Backend
+        working-directory: backend
+        run: |
+          npm ci
+          npm run lint
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lint Worker
+        working-directory: worker
+        run: |
+          pip install flake8
+          flake8 src/ --max-line-length=120 --ignore=E501,W503
+
+      - name: Lint Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npx eslint src/ --max-warnings=0 || true
+
+  # ========================
+  # Job 2: Build & Push Docker Images
+  # ========================
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Generate image tag
+        id: tag
+        run: echo "TAG=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Backend
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-backend:${{ steps.tag.outputs.TAG }}
+            ${{ env.IMAGE_PREFIX }}-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Frontend
+      - name: Build & Push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-frontend:${{ steps.tag.outputs.TAG }}
+            ${{ env.IMAGE_PREFIX }}-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Worker
+      - name: Build & Push Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}-worker:${{ steps.tag.outputs.TAG }}
+            ${{ env.IMAGE_PREFIX }}-worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+    outputs:
+      image-tag: ${{ steps.tag.outputs.TAG }}
+
+  # ========================
+  # Job 3: Update Infra Repo (GitOps trigger)
+  # ========================
+  update-infra:
+    name: Update Infra Repository
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.DOCKER_USERNAME }}/ai-task-infra
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Update image tags in K8s manifests
+        working-directory: infra
+        run: |
+          TAG=${{ needs.build-and-push.outputs.image-tag }}
+          PREFIX=${{ env.IMAGE_PREFIX }}
+
+          # Update backend image tag
+          sed -i "s|image: ${PREFIX}-backend:.*|image: ${PREFIX}-backend:${TAG}|g" k8s/backend-deployment.yaml
+
+          # Update frontend image tag
+          sed -i "s|image: ${PREFIX}-frontend:.*|image: ${PREFIX}-frontend:${TAG}|g" k8s/frontend-deployment.yaml
+
+          # Update worker image tag
+          sed -i "s|image: ${PREFIX}-worker:.*|image: ${PREFIX}-worker:${TAG}|g" k8s/worker-deployment.yaml
+
+      - name: Commit and push changes
+        working-directory: infra
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: update image tags to ${{ needs.build-and-push.outputs.image-tag }}"
+          git push
